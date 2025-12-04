@@ -20,11 +20,10 @@ from qgis.core import (QgsProcessing,
                        QgsFeatureRequest,
                        QgsProcessingParameterBoolean,
                        QgsProcessingException,
-                       QgsCoordinateTransform) # Важный импорт
+                       QgsCoordinateTransform)
 from qgis import processing
 
 class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
-    # Константы
     INPUT_STOPS_IN = 'INPUT_STOPS_IN'
     INPUT_STOPS_OUT = 'INPUT_STOPS_OUT'
     INPUT_GRAPH = 'INPUT_GRAPH'
@@ -57,52 +56,54 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
         return 'hackathon'
 
     def initAlgorithm(self, config=None):
-        # 1. Остановки В РАЙОН
+        # остановки для входа в район
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.INPUT_STOPS_IN, self.tr('Остановки (Вход в район)'), [QgsProcessing.TypeVectorPoint]))
         
-        # 2. Остановки ИЗ РАЙОНА
+        # остановки для выезда из района
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.INPUT_STOPS_OUT, self.tr('Остановки (Выезд из района)'), [QgsProcessing.TypeVectorPoint]))
 
-        # 3. Граф
+        # пешеходный граф дорог
         self.addParameter(QgsProcessingParameterFeatureSource(
             self.INPUT_GRAPH, self.tr('Пешеходный граф (линии)'), [QgsProcessing.TypeVectorLine]))
 
-        # 4. Изолинии
+        # изолинии высот для учета рельефа
         self.addParameter(QgsProcessingParameterFeatureSource(
             self.INPUT_CONTOURS, self.tr('Изолинии высот'), [QgsProcessing.TypeVectorLine]))
         
+        # поле с высотой в изолиниях
         self.addParameter(QgsProcessingParameterField(
             self.CONTOUR_FIELD, self.tr('Поле высоты (в изолиниях)'), parentLayerParameterName=self.INPUT_CONTOURS, type=QgsProcessingParameterField.Numeric))
 
-        # 5. Здания
+        # здания с населением
         self.addParameter(QgsProcessingParameterFeatureSource(
             self.INPUT_BUILDINGS, self.tr('Здания (население)'), [QgsProcessing.TypeVectorPolygon, QgsProcessing.TypeVectorPoint]))
             
+        # поле с количеством жителей в зданиях
         self.addParameter(QgsProcessingParameterField(
             self.POPULATION_FIELD, self.tr('Поле кол-ва жильцов'), parentLayerParameterName=self.INPUT_BUILDINGS, type=QgsProcessingParameterField.Numeric))
 
-        # 6. Лимит
+        # лимит доступности в метрах
         self.addParameter(QgsProcessingParameterNumber(
             self.MAX_COST, self.tr('Лимит доступности (условные метры с учетом рельефа)'), type=QgsProcessingParameterNumber.Double, defaultValue=500.0))
 
-        # 7. Флажок использования рельефа
+        # флаг учета рельефа
         self.addParameter(QgsProcessingParameterBoolean(
             self.USE_RELIEF, self.tr('Учитывать рельеф'), defaultValue=True))
 
-        # Выходы
+        # выходные слои
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUTPUT_LAYER_IN, self.tr('Зона: Доступность В РАЙОН')))
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUTPUT_LAYER_OUT, self.tr('Зона: Доступность ИЗ РАЙОНА')))
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUTPUT_INTERSECTION, self.tr('Зона: ПОЛНАЯ ДОСТУПНОСТЬ')))
 
     def processAlgorithm(self, parameters, context, feedback):
         
-        # Получаем значение флажка и параметры
+        # получаем параметры
         use_relief = self.parameterAsBoolean(parameters, self.USE_RELIEF, context)
         max_cost = self.parameterAsDouble(parameters, self.MAX_COST, context)
         
-        # Функция-хелпер для получения слоя
+        # вспомогательная функция для получения слоя
         def get_layer_obj(layer_id_or_obj):
             if isinstance(layer_id_or_obj, str):
                 lyr = context.temporaryLayerStore().mapLayer(layer_id_or_obj)
@@ -112,14 +113,11 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
                 return QgsProcessingUtils.mapLayerFromString(layer_id_or_obj, context)
             return layer_id_or_obj
 
-        # =========================================================================
-        # 1. ПОДГОТОВКА ГРАФА
-        # =========================================================================
-        
+        # подготовка графа
         raw_graph_source = self.parameterAsVectorLayer(parameters, self.INPUT_GRAPH, context)
         
         if use_relief:
-            feedback.setProgressText("Этап 1: Сегментация графа (нарезка по 30м)...")
+            feedback.setProgressText("этап 1: сегментация графа (нарезка по 30м)...")
             split_graph_dict = processing.run("native:splitlinesbylength", {
                 'INPUT': raw_graph_source,
                 'LENGTH': 30, 
@@ -127,43 +125,42 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
             }, context=context, feedback=feedback, is_child_algorithm=True)
             working_graph_layer = get_layer_obj(split_graph_dict['OUTPUT']) 
         else:
-            feedback.setProgressText("Этап 1: Подготовка графа (без нарезки)...")
+            feedback.setProgressText("этап 1: подготовка графа (без нарезки)...")
             working_graph_layer = raw_graph_source
 
         if not working_graph_layer:
-            raise QgsProcessingException("Ошибка: Не удалось создать рабочий граф.")
+            raise QgsProcessingException("ошибка: не удалось создать рабочий граф.")
 
-        # --- НАСТРОЙКА РЕЛЬЕФА ---
-        get_z = lambda p: 0 # По умолчанию высота 0
+        # настройка функции получения высоты
+        get_z = lambda p: 0
         
         if use_relief:
-            feedback.setProgressText("Подготовка данных рельефа...")
+            feedback.setProgressText("подготовка данных рельефа...")
             source_contours = self.parameterAsSource(parameters, self.INPUT_CONTOURS, context)
             contour_field = self.parameterAsString(parameters, self.CONTOUR_FIELD, context)
             
-            # Строим индекс
+            # строим пространственный индекс изолиний
             contour_index = QgsSpatialIndex(source_contours.getFeatures(), feedback)
-            # Кэшируем значения высот {id: elevation}
+            # кэшируем значения высот
             contour_data = {f.id(): f[contour_field] for f in source_contours.getFeatures()}
             
-            # Настройка трансформации CRS (Граф -> Изолинии)
+            # трансформация координат между системами
             crs_graph = working_graph_layer.sourceCrs()
             crs_contours = source_contours.sourceCrs()
             
-            # Проверяем, валидны ли CRS
             if not crs_graph.isValid() or not crs_contours.isValid():
-                feedback.reportError("ВНИМАНИЕ: Неверная система координат у графа или изолиний!")
+                feedback.reportError("внимание: неверная система координат у графа или изолиний!")
 
             transform_to_contours = QgsCoordinateTransform(crs_graph, crs_contours, context.project())
             
             def get_z_impl(point):
                 try:
-                    # 1. Трансформируем точку в систему координат изолиний
+                    # трансформируем точку в crs изолиний
                     pt_tr = transform_to_contours.transform(point)
-                    # 2. Ищем ближайшую изолинию
+                    # ищем ближайшую изолинию
                     nearest_ids = contour_index.nearestNeighbor(pt_tr, 1)
                     if not nearest_ids: return 0
-                    # 3. Берем значение
+                    # берем значение высоты
                     val = contour_data.get(nearest_ids[0], 0)
                     return float(val) if val is not None else 0
                 except Exception as e:
@@ -171,7 +168,7 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
             
             get_z = get_z_impl
 
-        # --- РАСЧЕТ ВЕСОВ ---
+        # расчет весов ребер графа
         w_crs = working_graph_layer.sourceCrs()
         weighted_graph_layer = QgsVectorLayer(f"LineString?crs={w_crs.authid()}&index=yes", "WeightedGraph", "memory")
         pr = weighted_graph_layer.dataProvider()
@@ -183,9 +180,9 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
         total_feats = working_graph_layer.featureCount()
         
         total_penalty_accumulated = 0 
-        debug_printed = False # Чтобы вывести лог только один раз
+        debug_printed = False
 
-        feedback.setProgressText("Этап 2: Расчет стоимости прохода (вес ребра)...")
+        feedback.setProgressText("этап 2: расчет стоимости прохода (вес ребра)...")
         for i, feat in enumerate(iterator):
             if feedback.isCanceled(): break
             geom = feat.geometry()
@@ -210,13 +207,11 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
                     
                     delta_h = abs(z1 - z2)
                     
-                    # --- ЛОГИРОВАНИЕ (ВАЖНО ДЛЯ ПРОВЕРКИ) ---
                     if not debug_printed and i > 10 and delta_h > 0:
-                        feedback.pushInfo(f"DEBUG: Проверка рельефа работает! P1_z={z1}, P2_z={z2}, Delta={delta_h}")
+                        feedback.pushInfo(f"debug: проверка рельефа работает! p1_z={z1}, p2_z={z2}, delta={delta_h}")
                         debug_printed = True
-                    # ----------------------------------------
 
-                    # ШТРАФ: 5 условных метров за 1 метр перепада
+                    # штраф за перепад высот: 5 условных метров за 1 метр перепада
                     slope_penalty = delta_h * 5.0 
                     final_cost += slope_penalty
                     total_penalty_accumulated += slope_penalty
@@ -231,26 +226,24 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
 
         if use_relief:
             if total_penalty_accumulated == 0:
-                feedback.reportError("!!! ОШИБКА РЕЛЬЕФА: Общий начисленный штраф равен 0. Проверьте: 1) Пересекаются ли слои? 2) Верна ли проекция?")
+                feedback.reportError("!!! ошибка рельефа: общий начисленный штраф равен 0. проверьте: 1) пересекаются ли слои? 2) верна ли проекция?")
             else:
-                feedback.pushInfo(f"УСПЕХ: Учтен рельеф. Общий штраф: {int(total_penalty_accumulated)} м.")
+                feedback.pushInfo(f"успех: учтен рельеф. общий штраф: {int(total_penalty_accumulated)} м.")
 
         pr.addFeatures(features_to_add)
         weighted_graph_layer.updateExtents()
         
-        # =========================================================================
-        # 2. ПОСТРОЕНИЕ СПЛОШНЫХ ЗОН
-        # =========================================================================
-        feedback.setProgressText("Этап 3: Построение геометрии изохрон...")
+        # построение сплошных зон доступности
+        feedback.setProgressText("этап 3: построение геометрии изохрон...")
         
         layer_stops_in = self.parameterAsVectorLayer(parameters, self.INPUT_STOPS_IN, context)
         layer_stops_out = self.parameterAsVectorLayer(parameters, self.INPUT_STOPS_OUT, context)
 
         if not layer_stops_in or not layer_stops_out:
-            raise QgsProcessingException("Ошибка загрузки слоев остановок.")
+            raise QgsProcessingException("ошибка загрузки слоев остановок.")
 
         def build_zone_polygon(stops_layer, suffix):
-            # 1. Service Area (Линии)
+            # построение линий доступности
             lines_dict = processing.run("native:serviceareafromlayer", {
                 'INPUT': weighted_graph_layer, 
                 'STRATEGY': 0, 
@@ -265,10 +258,10 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
             
             res_lines = get_layer_obj(lines_dict['OUTPUT_LINES'])
             if not res_lines or res_lines.featureCount() == 0:
-                feedback.reportError(f"Не удалось построить маршруты для {suffix}")
+                feedback.reportError(f"не удалось построить маршруты для {suffix}")
                 return None
 
-            # 2. Буфер (Толстые линии) - Увеличили до 70м
+            # буферизация линий
             buffer_dict = processing.run("native:buffer", {
                 'INPUT': lines_dict['OUTPUT_LINES'],
                 'DISTANCE': 70, 
@@ -276,16 +269,15 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
                 'OUTPUT': 'TEMPORARY_OUTPUT'
             }, context=context, feedback=feedback, is_child_algorithm=True)
             
-            # 3. Удаление дырок (Превращение бубликов в сплошные блины)
-            # Это решает проблему "Векторов вдоль дорог"
-            feedback.setProgressText(f"Заливка пустот для зоны {suffix}...")
+            # удаление дырок внутри полигонов
+            feedback.setProgressText(f"заливка пустот для зоны {suffix}...")
             filled_dict = processing.run("native:deleteholes", {
                 'INPUT': buffer_dict['OUTPUT'],
-                'MIN_AREA': 1000000, # Удаляем любые дырки меньше 1 кв.км (практически все внутри)
+                'MIN_AREA': 1000000,
                 'OUTPUT': 'TEMPORARY_OUTPUT'
             }, context=context, feedback=feedback, is_child_algorithm=True)
 
-            # 4. Исправление геометрии (на всякий случай)
+            # исправление геометрии
             fixed_dict = processing.run("native:fixgeometries", {
                 'INPUT': filled_dict['OUTPUT'],
                 'OUTPUT': 'TEMPORARY_OUTPUT'
@@ -293,17 +285,14 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
             
             return get_layer_obj(fixed_dict['OUTPUT'])
 
-        zone_in = build_zone_polygon(layer_stops_in, "ВХОД")
-        zone_out = build_zone_polygon(layer_stops_out, "ВЫХОД")
+        zone_in = build_zone_polygon(layer_stops_in, "вход")
+        zone_out = build_zone_polygon(layer_stops_out, "выход")
         
         if not zone_in or not zone_out:
-             raise QgsProcessingException("Сбой при построении зон.")
+             raise QgsProcessingException("сбой при построении зон.")
 
-        # =========================================================================
-        # 3. ПЕРЕСЕЧЕНИЕ И НАСЕЛЕНИЕ
-        # =========================================================================
-        
-        feedback.setProgressText("Этап 4: Пересечение зон...")
+        # пересечение зон для получения общей доступности
+        feedback.setProgressText("этап 4: пересечение зон...")
         zone_inter_dict = processing.run("native:intersection", {
             'INPUT': zone_in,
             'OVERLAY': zone_out,
@@ -311,8 +300,8 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
         }, context=context, feedback=feedback, is_child_algorithm=True)
         zone_inter = get_layer_obj(zone_inter_dict['OUTPUT'])
 
-        # 4. Подсчет населения
-        feedback.setProgressText("Этап 5: Подсчет населения...")
+        # подсчет населения в зонах
+        feedback.setProgressText("этап 5: подсчет населения...")
         pop_source = self.parameterAsSource(parameters, self.INPUT_BUILDINGS, context)
         pop_field = self.parameterAsString(parameters, self.POPULATION_FIELD, context)
 
@@ -326,6 +315,7 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
             if zone_feat:
                 zone_geom = zone_feat.geometry()
                 
+                # используем пространственный индекс для быстрого поиска зданий
                 bld_idx = QgsSpatialIndex(pop_source.getFeatures(), feedback)
                 candidate_ids = bld_idx.intersects(zone_geom.boundingBox())
                 req = QgsFeatureRequest().setFilterFids(candidate_ids)
@@ -337,7 +327,7 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
             
             feedback.pushInfo(f"--- {name}: {int(total_pop)} чел. ---")
             
-            # Добавление атрибута
+            # добавляем поле с рассчитанным населением
             res_dict = processing.run("native:addfieldtoattributestable", {
                 'INPUT': zone_lyr,
                 'FIELD_NAME': 'calc_pop',
@@ -354,16 +344,16 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
                 res_lyr.commitChanges()
             return res_lyr
 
-        final_in = calc_pop(zone_in, "В РАЙОН")
-        final_out = calc_pop(zone_out, "ИЗ РАЙОНА")
-        final_inter = calc_pop(zone_inter, "ПЕРЕСЕЧЕНИЕ")
+        final_in = calc_pop(zone_in, "в район")
+        final_out = calc_pop(zone_out, "из района")
+        final_inter = calc_pop(zone_inter, "пересечение")
 
-        # Сохранение результатов
+        # сохранение результатов
         results = {}
         outputs_map = [
-            (final_in, self.OUTPUT_LAYER_IN, "Зона_Вход"),
-            (final_out, self.OUTPUT_LAYER_OUT, "Зона_Выход"),
-            (final_inter, self.OUTPUT_INTERSECTION, "Зона_Общая")
+            (final_in, self.OUTPUT_LAYER_IN, "зона_вход"),
+            (final_out, self.OUTPUT_LAYER_OUT, "зона_выход"),
+            (final_inter, self.OUTPUT_INTERSECTION, "зона_общая")
         ]
 
         for layer, sink_name, debug_name in outputs_map:
@@ -374,10 +364,9 @@ class TransportAccessibilityIsochrones(QgsProcessingAlgorithm):
                     sink.addFeatures(layer.getFeatures(), QgsFeatureSink.FastInsert)
                     results[sink_name] = dest_id
                     
-                    # Для отладки добавляем на карту (можно закомментировать)
+                    # для отладки можно добавить слои на карту
                     stored_lyr = QgsProcessingUtils.mapLayerFromString(dest_id, context)
                     if stored_lyr:
                         stored_lyr.setName(debug_name)
-                        # QgsProject.instance().addMapLayer(stored_lyr)
 
         return results
